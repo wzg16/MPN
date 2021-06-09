@@ -53,13 +53,13 @@ class Encoder(torch.nn.Module):
 
         tensorConv4 = self.moduleConv4(tensorPool3)
         
-        return tensorConv4, tensorConv1, tensorConv2, tensorConv3
+        return tensorConv4, tensorConv1, tensorConv2, tensorConv3 # 保存每一层的特征
     
 class Decoder_new(torch.nn.Module):
     def __init__(self, t_length = 5, n_channel =3):
         super(Decoder_new, self).__init__()
         
-        def Basic(intInput, intOutput):
+        def Basic(intInput, intOutput): # 卷积操作
             return torch.nn.Sequential(
                 torch.nn.Conv2d(in_channels=intInput, out_channels=intOutput, kernel_size=3, stride=1, padding=1),
                 torch.nn.ReLU(inplace=False),
@@ -68,14 +68,14 @@ class Decoder_new(torch.nn.Module):
             )
                 
         
-        def Upsample(nc, intOutput):
+        def Upsample(nc, intOutput): # 上采样
             return torch.nn.Sequential(
                 torch.nn.ConvTranspose2d(in_channels = nc, out_channels=intOutput, kernel_size = 3, stride = 2, padding = 1, output_padding = 1),
                 torch.nn.ReLU(inplace=False)
             )
       
-        self.moduleConv = Basic(512, 512)
-        self.moduleUpsample4 = Upsample(512, 256)
+        self.moduleConv = Basic(512, 512) # 卷积
+        self.moduleUpsample4 = Upsample(512, 256)# 上采样
 
         self.moduleDeconv3 = Basic(512, 256)
         self.moduleUpsample3 = Upsample(256, 128)
@@ -88,7 +88,7 @@ class Decoder_new(torch.nn.Module):
         tensorConv = self.moduleConv(x)
 
         tensorUpsample4 = self.moduleUpsample4(tensorConv)
-        cat4 = torch.cat((skip3, tensorUpsample4), dim = 1)
+        cat4 = torch.cat((skip3, tensorUpsample4), dim = 1) # 实际是Unet结构
         
         tensorDeconv3 = self.moduleDeconv3(cat4)
         tensorUpsample3 = self.moduleUpsample3(tensorDeconv3)
@@ -98,13 +98,15 @@ class Decoder_new(torch.nn.Module):
         tensorUpsample2 = self.moduleUpsample2(tensorDeconv2)
         cat2 = torch.cat((skip1, tensorUpsample2), dim = 1)
                 
-        return cat2
+        return cat2 # decoder最后输出的不是视频帧，而是最顶层concat之后的特征，这个特征经过卷积操作之后才最终生成视频帧。所以得到的是视频帧的特征，shape与视频帧相同？
 
 class convAE(torch.nn.Module):
+    # 输入4帧，预测第五帧，bottleneck处的特征矢量长度是512
     def __init__(self, n_channel=3,  t_length=5, proto_size=10, feature_dim=512, key_dim=512, temp_update=0.1, temp_gather=0.1):
         super(convAE, self).__init__()
 
         def Outhead(intInput, intOutput, nc):
+            """ 一系列卷积操作，目的是？ """
             return torch.nn.Sequential(
                 torch.nn.Conv2d(in_channels=intInput, out_channels=nc, kernel_size=3, stride=1, padding=1),
                 torch.nn.ReLU(inplace=False),
@@ -114,20 +116,20 @@ class convAE(torch.nn.Module):
                 torch.nn.Tanh()
             )
 
-        self.encoder = Encoder(t_length, n_channel)
-        self.decoder = Decoder_new(t_length, n_channel)
-        self.prototype = Meta_Prototype(proto_size, feature_dim, key_dim, temp_update, temp_gather)
+        self.encoder = Encoder(t_length, n_channel) #定义encoder对象
+        self.decoder = Decoder_new(t_length, n_channel) # 定义decoder对象
+        self.prototype = Meta_Prototype(proto_size, feature_dim, key_dim, temp_update, temp_gather)# 定义“原型”类对象
         # output_head
         self.ohead = Outhead(128,n_channel,64)
 
-    def set_learnable_params(self, layers):
+    def set_learnable_params(self, layers):# 网络层 layers的参数为可训练的，其余的置为不可训练
         for k,p in self.named_parameters():
-            if any([k.startswith(l) for l in layers]):
+            if any([k.startswith(l) for l in layers]):# l是小写的L， 不是数字1
                 p.requires_grad = True
             else:
                 p.requires_grad = False
 
-    def get_learnable_params(self):
+    def get_learnable_params(self):# 获取可训练的参数
         params = OrderedDict()
         for k, p in self.named_parameters():
             if p.requires_grad:
@@ -135,7 +137,7 @@ class convAE(torch.nn.Module):
                 params[k] = p
         return params
 
-    def get_params(self, layers):
+    def get_params(self, layers):# 获取指定网络layers的所有参数
         params = OrderedDict()
         for k, p in self.named_parameters():
             if any([k.startswith(l) for l in layers]):
@@ -145,24 +147,26 @@ class convAE(torch.nn.Module):
 
     def forward(self, x, weights=None, train=True):
         
+        # unet predict
         fea, skip1, skip2, skip3 = self.encoder(x)
-        new_fea = self.decoder(fea, skip1, skip2, skip3)
-
-        new_fea = F.normalize(new_fea, dim=1)
+        new_fea = self.decoder(fea, skip1, skip2, skip3)# new_fea是重构视频帧的特征
+        # 新特征归一化
+        new_fea = F.normalize(new_fea, dim=1)# 视频帧特征归一化
         
-        if train:
-            updated_fea, keys, fea_loss, cst_loss, dis_loss = self.prototype(new_fea, new_fea, weights, train)
-            if weights == None:
+        if train:# 训练阶段
+            updated_fea, keys, fea_loss, cst_loss, dis_loss = self.prototype(new_fea, new_fea, weights, train) # 输入两个new_fea的意思是？
+            if weights == None:# 如果权重为空
                 output = self.ohead(updated_fea)
-            else:
+            else: # weights的数据格式是？
                 x = conv2d(updated_fea, weights['ohead.0.weight'], weights['ohead.0.bias'], stride=1, padding=1)
                 x = relu(x)
                 x = conv2d(x, weights['ohead.2.weight'], weights['ohead.2.bias'], stride=1, padding=1)
                 x = relu(x)
                 x = conv2d(x, weights['ohead.4.weight'], weights['ohead.4.bias'], stride=1, padding=1)
-                output = F.tanh(x)
+                output = F.tanh(x) # 这个output是最后生成的视频帧。
                 
             return output, fea, updated_fea, keys, fea_loss, cst_loss, dis_loss
+            # output是最后的输出视频帧，fea是encoder得到的特征， update_fea
         
         #test
         else:
